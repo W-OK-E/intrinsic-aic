@@ -17,6 +17,11 @@
 
 import numpy as np
 
+# import sys
+# sys.path.append("/home/karthikeya/Manas/ws_aic/.venv-2/lib/python3.12/site-packages")
+
+import os
+
 from aic_model.policy import (
     GetObservationCallback,
     MoveRobotCallback,
@@ -30,9 +35,64 @@ from rclpy.duration import Duration
 from rclpy.time import Time
 from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 QuaternionTuple = tuple[float, float, float, float]
 
+class ControlledRecorder:
+    def __init__(self):
+        self.repo_id = "ProjectMANAS/aic-cable-insertion"
+        self.root = os.path.join(os.getcwd(), "dataset")
+        features = {
+            "observation.images.left_camera": {"dtype": "video", "shape": [1024, 1152, 3]},
+            "observation.images.center_camera": {"dtype": "video", "shape": [1024, 1152, 3]},
+            "observation.images.right_camera": {"dtype": "video", "shape": [1024, 1152, 3]},
+            "observation.state": {"dtype": "float32", "shape": (26,)},
+            "action": {"dtype": "float32", "shape": (7,)},
+            # "task": {"dtype": "string"},
+        }
+        if os.path.isdir(self.root):
+            self.dataset = LeRobotDataset.resume(repo_id=self.repo_id, root=self.root)
+        else:
+            self.dataset = LeRobotDataset.create(repo_id=self.repo_id, root=self.root, features=features, fps=30)
+
+    def start(self, metadata):
+        self.metadata = metadata
+
+    def stop(self):
+        self.dataset.save_episode()
+        self.dataset.finalize()
+
+    def record_step(self, obs, action):
+
+        def extract_img(raw_img):
+            return np.frombuffer(raw_img.data, dtype=np.uint8).reshape(
+                raw_img.height, raw_img.width, 3
+            )
+
+        tcp_pose = obs.controller_state.tcp_pose
+        tcp_vel = obs.controller_state.tcp_velocity
+        state_np = np.array([
+            tcp_pose.position.x, tcp_pose.position.y, tcp_pose.position.z,
+            tcp_pose.orientation.x, tcp_pose.orientation.y, tcp_pose.orientation.z, tcp_pose.orientation.w,
+            tcp_vel.linear.x, tcp_vel.linear.y, tcp_vel.linear.z,
+            tcp_vel.angular.x, tcp_vel.angular.y, tcp_vel.angular.z,
+            *obs.controller_state.tcp_error,
+            *obs.joint_states.position[:7],
+        ], dtype=np.float32)
+
+        action_np = np.array([
+            action.position.x, action.position.y, action.position.z,
+            action.orientation.x, action.orientation.y, action.orientation.z, action.orientation.w,
+        ], dtype=np.float32)
+        self.dataset.add_frame({
+            "observation.images.left_camera": extract_img(obs.left_image),
+            "observation.images.center_camera": extract_img(obs.center_image),
+            "observation.images.right_camera": extract_img(obs.right_image),
+            "observation.state": state_np,
+            "action": action_np,
+            "task": self.metadata["task"],
+        })
 
 class CheatCode(Policy):
     def __init__(self, parent_node):
@@ -40,6 +100,8 @@ class CheatCode(Policy):
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._task = None
+        # Controlled Recording
+        self.recorder = ControlledRecorder()
         super().__init__(parent_node)
 
     def _wait_for_tf(
@@ -193,6 +255,16 @@ class CheatCode(Policy):
     ):
         self.get_logger().info(f"CheatCode.insert_cable() task: {task}")
         self._task = task
+        self.recorder.start({
+            "task": "Rotate and insert the cable into the target port", 
+            "cable_type": task.cable_type, 
+            "cable_name": task.cable_name, 
+            "plug_type": task.plug_type, 
+            "plug_name": task.plug_name, 
+            "port_type": task.port_type, 
+            "port_name": task.port_name, 
+            "target_module_name": task.target_module_name
+        })
 
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
@@ -221,16 +293,14 @@ class CheatCode(Policy):
         for t in range(0, 100):
             interp_fraction = t / 100.0
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self.calc_gripper_pose(
-                        port_transform,
-                        slerp_fraction=interp_fraction,
-                        position_fraction=interp_fraction,
-                        z_offset=z_offset,
-                        reset_xy_integrator=True,
-                    ),
-                )
+                pose = self.calc_gripper_pose(port_transform, slerp_fraction=interp_fraction, position_fraction=interp_fraction, z_offset=z_offset, reset_xy_integrator=True)
+                
+                # get obvs and record step
+                obs_msg = get_observation()
+                if obs_msg is not None:
+                    self.recorder.record_step(obs_msg, pose)
+                
+                self.set_pose_target(move_robot=move_robot, pose=pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
             self.sleep_for(0.05)
@@ -243,16 +313,23 @@ class CheatCode(Policy):
             z_offset -= 0.0005
             self.get_logger().info(f"z_offset: {z_offset:0.5}")
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self.calc_gripper_pose(port_transform, z_offset=z_offset),
-                )
+                pose = self.calc_gripper_pose(port_transform, z_offset=z_offset)
+                
+                # get obvs and record step
+                obs_msg = get_observation()
+                if obs_msg is not None:
+                    self.recorder.record_step(obs_msg, pose)
+
+                self.set_pose_target(move_robot=move_robot, pose=pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insertion: {ex}")
             self.sleep_for(0.05)
 
         self.get_logger().info("Waiting for connector to stabilize...")
         self.sleep_for(5.0)
+        
+        # Episode complete, save datset
+        self.recorder.stop()
 
         self.get_logger().info("CheatCode.insert_cable() exiting...")
         return True
